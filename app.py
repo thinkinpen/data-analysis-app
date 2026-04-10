@@ -1,6 +1,8 @@
 import io
+import re
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import BinaryIO, Optional
 
@@ -16,31 +18,89 @@ try:
 except ModuleNotFoundError:
     st = None
 
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover - optional dependency fallback
+    PdfReader = None
+
 
 APP_TITLE = "Data Analysis App"
-SUPPORTED_EXTENSIONS = (".csv", ".xlsx", ".xls")
+SUPPORTED_EXTENSIONS = (".csv", ".xlsx", ".xls", ".pdf")
+STOP_WORDS = {
+    "the", "and", "for", "that", "with", "you", "this", "from", "are", "was",
+    "have", "has", "had", "but", "not", "all", "can", "will", "your", "into",
+    "their", "there", "they", "them", "would", "could", "should", "about", "after",
+    "before", "when", "where", "which", "while", "what", "how", "why", "been",
+    "were", "being", "than", "then", "also", "such", "may", "any", "each", "our",
+    "out", "use", "used", "using", "more", "most", "other", "some", "these", "those",
+    "his", "her", "she", "him", "its", "it", "of", "to", "in", "on", "at", "by",
+    "an", "a", "or", "as", "is", "be", "if", "we", "us", "do", "does", "did"
+}
 
 
-def read_dataframe(file_obj: BinaryIO, filename: str) -> pd.DataFrame:
-    """Read a CSV or Excel file into a DataFrame."""
+def detect_file_type(filename: str) -> str:
     lowered = filename.lower()
     if lowered.endswith(".csv"):
-        return pd.read_csv(file_obj)
+        return "csv"
     if lowered.endswith((".xlsx", ".xls")):
-        return pd.read_excel(file_obj)
-    raise ValueError("Unsupported file format. Please upload a CSV or Excel file.")
+        return "excel"
+    if lowered.endswith(".pdf"):
+        return "pdf"
+    raise ValueError("Unsupported file format. Please upload a CSV, Excel, or PDF file.")
+
+
+def list_excel_sheets(file_obj: BinaryIO) -> list[str]:
+    file_obj.seek(0)
+    workbook = pd.ExcelFile(file_obj)
+    return workbook.sheet_names
+
+
+def read_dataframe(file_obj: BinaryIO, filename: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+    """Read a CSV or Excel file into a DataFrame."""
+    file_type = detect_file_type(filename)
+    file_obj.seek(0)
+
+    if file_type == "csv":
+        return pd.read_csv(file_obj)
+    if file_type == "excel":
+        return pd.read_excel(file_obj, sheet_name=sheet_name or 0)
+
+    raise ValueError("Tabular analysis is only available for CSV and Excel files.")
+
+
+def extract_pdf_text(file_obj: BinaryIO) -> tuple[str, int]:
+    if PdfReader is None:
+        raise RuntimeError("PDF support is not installed. Add 'pypdf' to requirements.txt.")
+
+    file_obj.seek(0)
+    reader = PdfReader(file_obj)
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages).strip(), len(reader.pages)
 
 
 if st is not None:
 
     @st.cache_data
-    def load_data(uploaded_file) -> pd.DataFrame:
-        return read_dataframe(uploaded_file, uploaded_file.name)
+    def load_data(uploaded_file, sheet_name: Optional[str] = None) -> pd.DataFrame:
+        return read_dataframe(uploaded_file, uploaded_file.name, sheet_name=sheet_name)
+
+    @st.cache_data
+    def load_pdf_text(uploaded_file) -> tuple[str, int]:
+        return extract_pdf_text(uploaded_file)
 
 else:
 
-    def load_data(uploaded_file) -> pd.DataFrame:
-        return read_dataframe(uploaded_file, getattr(uploaded_file, "name", "uploaded_file.csv"))
+    def load_data(uploaded_file, sheet_name: Optional[str] = None) -> pd.DataFrame:
+        return read_dataframe(
+            uploaded_file,
+            getattr(uploaded_file, "name", "uploaded_file.csv"),
+            sheet_name=sheet_name,
+        )
+
+    def load_pdf_text(uploaded_file) -> tuple[str, int]:
+        return extract_pdf_text(uploaded_file)
 
 
 def apply_cleaning_options(
@@ -104,6 +164,26 @@ def save_dataframe(df: pd.DataFrame, path: str) -> None:
     raise ValueError("Output file must end with .csv or .xlsx")
 
 
+def tokenize_text(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z]{3,}", text.lower())
+
+
+def summarize_pdf_text(text: str, page_count: int) -> dict:
+    words = tokenize_text(text)
+    filtered_words = [word for word in words if word not in STOP_WORDS]
+    top_words = Counter(filtered_words).most_common(15)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    return {
+        "pages": page_count,
+        "characters": len(text),
+        "words": len(words),
+        "lines": len(lines),
+        "top_words": pd.DataFrame(top_words, columns=["word", "count"]),
+        "preview": "\n".join(lines[:30]) if lines else "",
+    }
+
+
 def render_histogram(df: pd.DataFrame, column: str):
     if plt is None:
         raise RuntimeError("matplotlib is not available in this environment.")
@@ -150,23 +230,7 @@ def render_scatter_plot(df: pd.DataFrame, x_col: str, y_col: str):
     return fig
 
 
-def run_streamlit_app() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
-    st.title("📊 Data Analysis App")
-    st.write("Upload a CSV or Excel file to clean, analyze, and visualize your data.")
-
-    uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx", "xls"])
-
-    if uploaded_file is None:
-        st.info("Upload a file to begin.")
-        return
-
-    try:
-        df = load_data(uploaded_file)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        return
-
+def render_table_analysis(df: pd.DataFrame) -> None:
     st.success("File uploaded successfully.")
 
     with st.sidebar:
@@ -190,16 +254,12 @@ def run_streamlit_app() -> None:
             ],
         )
 
-    try:
-        work_df = apply_cleaning_options(
-            df,
-            selected_columns=selected_columns,
-            remove_duplicates=remove_duplicates,
-            fill_missing=fill_missing,
-        )
-    except Exception as e:
-        st.error(f"Could not clean data: {e}")
-        return
+    work_df = apply_cleaning_options(
+        df,
+        selected_columns=selected_columns,
+        remove_duplicates=remove_duplicates,
+        fill_missing=fill_missing,
+    )
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Preview", "Summary", "Missing Values", "Charts", "Export"]
@@ -230,38 +290,35 @@ def run_streamlit_app() -> None:
             "Choose chart type", ["Bar Chart", "Histogram", "Line Chart", "Scatter Plot"]
         )
 
-        try:
-            if chart_type == "Histogram":
-                if not numeric_columns:
-                    st.warning("No numeric columns available.")
-                else:
-                    hist_col = st.selectbox("Select numeric column", numeric_columns)
-                    st.pyplot(render_histogram(work_df, hist_col))
+        if chart_type == "Histogram":
+            if not numeric_columns:
+                st.warning("No numeric columns available.")
+            else:
+                hist_col = st.selectbox("Select numeric column", numeric_columns)
+                st.pyplot(render_histogram(work_df, hist_col))
 
-            elif chart_type == "Bar Chart":
-                if not categorical_columns:
-                    st.warning("No categorical columns available.")
-                else:
-                    cat_col = st.selectbox("Select category column", categorical_columns)
-                    st.pyplot(render_bar_chart(work_df, cat_col))
+        elif chart_type == "Bar Chart":
+            if not categorical_columns:
+                st.warning("No categorical columns available.")
+            else:
+                cat_col = st.selectbox("Select category column", categorical_columns)
+                st.pyplot(render_bar_chart(work_df, cat_col))
 
-            elif chart_type == "Line Chart":
-                if not numeric_columns:
-                    st.warning("No numeric columns available.")
-                else:
-                    line_col = st.selectbox("Select numeric column", numeric_columns)
-                    st.pyplot(render_line_chart(work_df, line_col))
+        elif chart_type == "Line Chart":
+            if not numeric_columns:
+                st.warning("No numeric columns available.")
+            else:
+                line_col = st.selectbox("Select numeric column", numeric_columns)
+                st.pyplot(render_line_chart(work_df, line_col))
 
-            elif chart_type == "Scatter Plot":
-                if len(numeric_columns) < 2:
-                    st.warning("At least two numeric columns are needed for a scatter plot.")
-                else:
-                    x_col = st.selectbox("X-axis", numeric_columns, index=0)
-                    default_y_index = 1 if len(numeric_columns) > 1 else 0
-                    y_col = st.selectbox("Y-axis", numeric_columns, index=default_y_index)
-                    st.pyplot(render_scatter_plot(work_df, x_col, y_col))
-        except Exception as e:
-            st.error(f"Could not render chart: {e}")
+        elif chart_type == "Scatter Plot":
+            if len(numeric_columns) < 2:
+                st.warning("At least two numeric columns are needed for a scatter plot.")
+            else:
+                x_col = st.selectbox("X-axis", numeric_columns, index=0)
+                default_y_index = 1 if len(numeric_columns) > 1 else 0
+                y_col = st.selectbox("Y-axis", numeric_columns, index=default_y_index)
+                st.pyplot(render_scatter_plot(work_df, x_col, y_col))
 
     with tab5:
         st.subheader("Export Cleaned Data")
@@ -285,6 +342,64 @@ def run_streamlit_app() -> None:
         )
 
 
+def render_pdf_analysis(text: str, page_count: int) -> None:
+    summary = summarize_pdf_text(text, page_count)
+    st.success("PDF uploaded successfully.")
+
+    tab1, tab2, tab3 = st.tabs(["Overview", "Text Preview", "Top Words"])
+
+    with tab1:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Pages", summary["pages"])
+        col2.metric("Words", summary["words"])
+        col3.metric("Lines", summary["lines"])
+        col4.metric("Characters", summary["characters"])
+
+        if summary["words"] == 0:
+            st.warning("No readable text was found in this PDF. It may be scanned images rather than text.")
+
+    with tab2:
+        st.subheader("Extracted Text Preview")
+        st.text_area("PDF text", summary["preview"] or "No readable text found.", height=400)
+
+    with tab3:
+        st.subheader("Most Common Words")
+        if summary["top_words"].empty:
+            st.info("No keywords found.")
+        else:
+            st.dataframe(summary["top_words"], use_container_width=True)
+
+
+def run_streamlit_app() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
+    st.title("📊 Data Analysis App")
+    st.write("Upload a CSV, Excel, or PDF file to analyze it.")
+
+    uploaded_file = st.file_uploader("Upload your file", type=["csv", "xlsx", "xls", "pdf"])
+
+    if uploaded_file is None:
+        st.info("Upload a file to begin.")
+        return
+
+    file_type = detect_file_type(uploaded_file.name)
+
+    try:
+        if file_type == "pdf":
+            text, page_count = load_pdf_text(uploaded_file)
+            render_pdf_analysis(text, page_count)
+            return
+
+        sheet_name = None
+        if file_type == "excel":
+            sheet_names = list_excel_sheets(uploaded_file)
+            sheet_name = st.sidebar.selectbox("Select Excel sheet", sheet_names)
+
+        df = load_data(uploaded_file, sheet_name=sheet_name)
+        render_table_analysis(df)
+    except Exception as e:
+        st.error(f"Could not analyze file: {e}")
+
+
 def run_cli_app(argv: list[str]) -> int:
     if len(argv) < 2:
         print(
@@ -293,7 +408,7 @@ def run_cli_app(argv: list[str]) -> int:
             "  python app.py <input_file> [output_file]\n"
             "  python app.py --test\n"
             "Or install the full app dependencies and run:\n"
-            "  pip install streamlit matplotlib pandas openpyxl\n"
+            "  pip install streamlit matplotlib pandas openpyxl pypdf\n"
             "  streamlit run app.py"
         )
         return 0
@@ -303,7 +418,20 @@ def run_cli_app(argv: list[str]) -> int:
         print(f"Input file not found: {input_path}")
         return 1
 
+    file_type = detect_file_type(input_path.name)
     with input_path.open("rb") as f:
+        if file_type == "pdf":
+            text, page_count = extract_pdf_text(f)
+            summary = summarize_pdf_text(text, page_count)
+            print(f"{APP_TITLE} - PDF Analysis\n")
+            print(f"Pages: {summary['pages']}")
+            print(f"Words: {summary['words']}")
+            print(f"Lines: {summary['lines']}")
+            print(f"Characters: {summary['characters']}\n")
+            print("Top Words:")
+            print(summary["top_words"].to_string(index=False))
+            return 0
+
         df = read_dataframe(f, input_path.name)
 
     cleaned = apply_cleaning_options(df)
@@ -362,8 +490,24 @@ def _run_self_tests() -> int:
     csv_df = read_dataframe(io.BytesIO(csv_bytes), "demo.csv")
     assert csv_df.shape == (2, 2)
 
+    tokens = tokenize_text("Tax law tax audit finance finance finance")
+    assert "finance" in tokens
+    summary = summarize_pdf_text("Tax law tax audit finance finance finance", 2)
+    assert summary["pages"] == 2
+    assert int(summary["top_words"].iloc[0]["count"]) >= 1
+
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        pd.DataFrame({"a": [1, 2]}).to_excel(writer, index=False, sheet_name="First")
+        pd.DataFrame({"b": [3, 4]}).to_excel(writer, index=False, sheet_name="Second")
+    excel_buffer.seek(0)
+    assert list_excel_sheets(excel_buffer) == ["First", "Second"]
+    excel_buffer.seek(0)
+    excel_df = read_dataframe(excel_buffer, "demo.xlsx", sheet_name="Second")
+    assert list(excel_df.columns) == ["b"]
+
     try:
-        read_dataframe(io.BytesIO(b"test"), "demo.txt")
+        detect_file_type("demo.txt")
     except ValueError:
         pass
     else:
